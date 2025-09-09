@@ -1,0 +1,119 @@
+# =============================================================================
+# NAMESPACE & SECRET
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: redis
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: redis-auth
+  namespace: redis
+type: Opaque
+stringData:
+  REDIS_PASSWORD: "J@ck03061997"   # TODO: ganti password produksi
+
+# =============================================================================
+# SERVICE (ClusterIP)
+# =============================================================================
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: redis
+  labels: { app.kubernetes.io/name: redis }
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+
+# =============================================================================
+# STATEFULSET: SINGLE NODE (run as root)
+# =============================================================================
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: redis
+  labels:
+    app.kubernetes.io/name: redis
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis
+    spec:
+      # <<< JALANKAN SEBAGAI ROOT >>>
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+        fsGroup: 0
+      containers:
+        - name: redis
+          image: bitnami/redis:7.2
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: redis
+              containerPort: 6379
+          env:
+            - name: ALLOW_EMPTY_PASSWORD
+              value: "no"
+            - name: REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: redis-auth, key: REDIS_PASSWORD } }
+            - name: REDIS_TLS_ENABLED
+              value: "no"
+            - name: REDIS_APPENDONLY
+              value: "yes"              # aktifkan AOF
+            - name: REDIS_DISABLE_COMMANDS
+              value: "FLUSHDB,FLUSHALL"
+            - name: REDIS_EXTRA_FLAGS
+              value: >-
+                --logfile ""
+                --dir /bitnami/redis/data
+                --appendonly yes
+                --appendfilename appendonly.aof
+                --appendfsync everysec
+                --timeout 0
+          volumeMounts:
+            - { name: data,   mountPath: /bitnami/redis/data }
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { cpu: "1000m", memory: "1Gi" }
+          startupProbe:
+            tcpSocket: { port: 6379 }
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            tcpSocket: { port: 6379 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket: { port: 6379 }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: longhorn
+        resources:
+          requests:
+            storage: 5Gi

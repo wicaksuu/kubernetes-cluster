@@ -1,0 +1,199 @@
+# =========================
+# NAMESPACE (idempoten)
+# =========================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pma
+
+# =========================
+# DEPLOYMENT: TANPA MOUNT, 1 POD, RECREATE
+# =========================
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: phpmyadmin
+  namespace: pma
+  labels: { app: phpmyadmin }
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: phpmyadmin }
+  template:
+    metadata:
+      labels: { app: phpmyadmin }
+    spec:
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+        fsGroup: 0
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: phpmyadmin
+          image: phpmyadmin:5.2.1-apache
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+          env:
+            - { name: TZ,           value: Asia/Jakarta }
+            - { name: MEMORY_LIMIT, value: "512M" }
+            - { name: UPLOAD_LIMIT, value: "256M" }
+          command: ["/bin/bash","-lc"]
+          args:
+            - |
+              set -euo pipefail
+
+              # ----- php.ini override: sesi di /tmp (ephemeral) -----
+              cat >/usr/local/etc/php/conf.d/zzz-pma-sessions.ini <<'PHPINI'
+              session.save_handler = files
+              session.save_path = "/tmp"
+              session.use_strict_mode = 1
+              session.use_cookies = 1
+              session.use_only_cookies = 1
+              session.cookie_httponly = 1
+              session.cookie_samesite = Lax
+              session.cookie_secure = 1
+              session.cookie_path = /
+              session.cookie_domain = database.madiunkab.go.id
+              session.name = PMA_SESSID
+              session.gc_maxlifetime = 604800
+              session.cookie_lifetime = 604800
+              session.gc_probability = 1
+              session.gc_divisor = 100
+              session.lazy_write = 0
+              PHPINI
+
+              # ----- Buat folder & file konfigurasi phpMyAdmin -----
+              install -d -m 0755 /etc/phpmyadmin
+
+              # Secret WAJIB (dibaca dari config.inc.php core)
+              cat >/etc/phpmyadmin/config.secret.inc.php <<'PMASECRET'
+              <?php
+              $cfg['blowfish_secret'] = 'Y991KTxawQaIWKlYDUkanmOn8uAY5D15';
+              PMASECRET
+              chown 33:33 /etc/phpmyadmin/config.secret.inc.php
+              chmod 0640 /etc/phpmyadmin/config.secret.inc.php
+
+              # User config
+              cat >/etc/phpmyadmin/config.user.inc.php <<'PMACFG'
+              <?php
+              $cfg['PmaAbsoluteUri']  = 'https://database.madiunkab.go.id/';
+              $cfg['ForceSSL']        = true;
+
+              $cfg['LoginCookieValidity'] = 604800;
+              $cfg['LoginCookieStore']    = 1;
+              $cfg['LoginCookieSameSite'] = 'Lax';
+              $cfg['LoginCookiePath']     = '/';
+              $cfg['LoginCookieDomain']   = 'database.madiunkab.go.id';
+              $cfg['LoginCookieSecure']   = true;
+
+              // reverse-proxy awareness
+              $cfg['TrustedProxies']     = array('127.0.0.1/8','10.0.0.0/8','172.16.0.0/12','192.168.0.0/16','::1/128');
+              $cfg['ReverseProxyHeader'] = 'HTTP_X_FORWARDED_HOST';
+
+              if (!is_dir('/tmp-pma')) { @mkdir('/tmp-pma', 0777, true); }
+              $cfg['TempDir'] = '/tmp-pma';
+
+              $cfg['AllowArbitraryServer'] = false;
+
+              $i = 1;
+              $cfg['Servers'][$i]['verbose']   = 'Primary (writer)';
+              $cfg['Servers'][$i]['host']      = 'mariadb-primary.mariadb.svc.cluster.local';
+              $cfg['Servers'][$i]['port']      = 3306;
+              $cfg['Servers'][$i]['auth_type'] = 'cookie';
+              $cfg['Servers'][$i]['AllowNoPassword'] = false;
+
+              $i++;
+              $cfg['Servers'][$i]['verbose']   = 'Secondary pool (readers)';
+              $cfg['Servers'][$i]['host']      = 'mariadb-secondary.mariadb.svc.cluster.local';
+              $cfg['Servers'][$i]['port']      = 3306;
+              $cfg['Servers'][$i]['auth_type'] = 'cookie';
+              $cfg['Servers'][$i]['AllowNoPassword'] = false;
+
+              $i++;
+              $cfg['Servers'][$i]['verbose']   = 'Headless (pod-level)';
+              $cfg['Servers'][$i]['host']      = 'mariadb-headless.mariadb.svc.cluster.local';
+              $cfg['Servers'][$i]['port']      = 3306;
+              $cfg['Servers'][$i]['auth_type'] = 'cookie';
+              $cfg['Servers'][$i]['AllowNoPassword'] = false;
+
+              $cfg['ServerDefault'] = 1;
+              PMACFG
+              chown 33:33 /etc/phpmyadmin/config.user.inc.php
+              chmod 0640 /etc/phpmyadmin/config.user.inc.php
+
+              # Apache drop-in: HTTPS aware
+              cat >/etc/apache2/conf-enabled/servername.conf <<'APACHE'
+              ServerName database.madiunkab.go.id
+              ServerTokens Prod
+              ServerSignature Off
+              SetEnvIf X-Forwarded-Proto https HTTPS=on
+              APACHE
+              chmod 0644 /etc/apache2/conf-enabled/servername.conf
+
+              mkdir -p /tmp-pma && chmod 0777 /tmp-pma
+
+              # Start Apache
+              exec apache2-foreground
+          readinessProbe:
+            httpGet: { path: /index.php, port: 80 }
+            initialDelaySeconds: 12
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet: { path: /index.php, port: 80 }
+            initialDelaySeconds: 24
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }
+
+# =========================
+# SERVICE
+# =========================
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: phpmyadmin
+  namespace: pma
+spec:
+  type: ClusterIP
+  selector: { app: phpmyadmin }
+  ports:
+    - port: 80
+      targetPort: 80
+
+# =========================
+# INGRESS (TLS via NPM)
+# =========================
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pma-ingress
+  namespace: pma
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/proxy-body-size: "256m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: database.madiunkab.go.id
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: phpmyadmin
+                port:
+                  number: 80
